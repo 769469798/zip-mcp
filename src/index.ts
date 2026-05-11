@@ -1,4 +1,9 @@
-import { FastMCP } from "fastmcp";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   compressData,
@@ -10,11 +15,18 @@ import {
 import * as fs from "fs/promises";
 import * as path from "path";
 
-// Create FastMCP server instance
-const server = new FastMCP({
-  name: "ZIP MCP Server",
-  version: "1.0.3",
-});
+// Create server instance using native MCP SDK
+const server = new Server(
+  {
+    name: "ZIP MCP Server",
+    version: "1.0.6",
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
 
 // General error handling function
 const formatError = (error: unknown): string => {
@@ -52,7 +64,6 @@ const getAllFiles = async (
     if (stat.isDirectory()) {
       fileList = await getAllFiles(filePath, fileList, basePath);
     } else {
-      // Store relative path
       fileList.push(path.relative(basePath, filePath));
     }
   }
@@ -60,308 +71,333 @@ const getAllFiles = async (
   return fileList;
 };
 
-// Compression tool - Compress local files
-server.addTool({
-  name: "compress",
-  description: "Compress local files or directories into a ZIP file",
-  parameters: z.object({
-    input: z.union([
-      z.string(), // Single file or directory path
-      z.array(z.string()), // Multiple file or directory paths
-    ]),
-    output: z.string(), // Output ZIP file path
-    options: z
-      .object({
-      level: z.number().min(0).max(9).optional(),
-      comment: z.string().optional(),
-      password: z.string().optional(),
-      encryptionStrength: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
-      overwrite: z.boolean().optional(),
-      })
-      .optional(),
-    }),
-    execute: async (args) => {
-    try {
-      const outputPath = args.output;
-      // Separate CompressionOptions and other options
-      const { overwrite, ...compressionOptions } = args.options || {};
-      const shouldOverwrite = overwrite ?? false;
+// Register tools using ListToolsRequestSchema
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: "compress",
+        description: "Compress local files or directories into a ZIP file",
+        inputSchema: {
+          type: "object",
+          properties: {
+            input: {
+              type: "string",
+              description: "Path of the file or directory to be compressed",
+            },
+            output: {
+              type: "string",
+              description: "Path of the output ZIP file",
+            },
+            options: {
+              type: "object",
+              properties: {
+                level: {
+                  type: "number",
+                  minimum: 0,
+                  maximum: 9,
+                  description: "Compression level (0-9, default is 5)",
+                },
+                password: {
+                  type: "string",
+                  description: "Password protection",
+                },
+                encryptionStrength: {
+                  type: "number",
+                  enum: [1, 2, 3],
+                  description: "Encryption strength (1-3)",
+                },
+                overwrite: {
+                  type: "boolean",
+                  description: "Whether to overwrite existing files",
+                },
+              },
+            },
+          },
+          required: ["input", "output"],
+        },
+      },
+      {
+        name: "decompress",
+        description: "Decompress local ZIP file to specified directory",
+        inputSchema: {
+          type: "object",
+          properties: {
+            input: {
+              type: "string",
+              description: "Path of the ZIP file",
+            },
+            output: {
+              type: "string",
+              description: "Path of the output directory",
+            },
+            options: {
+              type: "object",
+              properties: {
+                password: {
+                  type: "string",
+                  description: "Decompression password",
+                },
+                overwrite: {
+                  type: "boolean",
+                  description: "Whether to overwrite existing files",
+                },
+                createDirectories: {
+                  type: "boolean",
+                  description: "Whether to create non-existent directories",
+                },
+              },
+            },
+          },
+          required: ["input", "output"],
+        },
+      },
+      {
+        name: "getZipInfo",
+        description: "Get metadata information of a local ZIP file",
+        inputSchema: {
+          type: "object",
+          properties: {
+            input: {
+              type: "string",
+              description: "Path of the ZIP file",
+            },
+            options: {
+              type: "object",
+              properties: {
+                password: {
+                  type: "string",
+                  description: "Decompression password",
+                },
+              },
+            },
+          },
+          required: ["input"],
+        },
+      },
+      {
+        name: "echo",
+        description: "Return the input message (for testing)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            message: {
+              type: "string",
+              description: "Message to be returned",
+            },
+          },
+          required: ["message"],
+        },
+      },
+    ],
+  };
+});
 
-      // Check if output path already exists
-      if ((await exists(outputPath)) && !shouldOverwrite) {
-        throw new Error(
-          `Output file ${outputPath} already exists. Set overwrite: true to overwrite.`
-        );
-      }
+// Handle tool calls
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
 
-      // Create output directory (if it doesn't exist)
-      const outputDir = path.dirname(outputPath);
-      if (!(await exists(outputDir))) {
-        await fs.mkdir(outputDir, { recursive: true });
-      }
+  try {
+    switch (name) {
+      case "compress": {
+        const input = args.input as string;
+        const output = args.output as string;
+        const options = args.options as {
+          level?: number;
+          password?: string;
+          encryptionStrength?: 1 | 2 | 3;
+          overwrite?: boolean;
+        } | undefined;
 
-      // Prepare input files
-      const inputPaths = Array.isArray(args.input) ? args.input : [args.input];
-      const filesToCompress: { name: string; data: Uint8Array }[] = [];
+        const { overwrite, ...compressionOptions } = options || {};
+        const shouldOverwrite = overwrite ?? false;
 
-      // Process each input path
-      for (const inputPath of inputPaths) {
-        if (!(await exists(inputPath))) {
-          throw new Error(`Input path not found: ${inputPath}`);
+        if ((await exists(output)) && !shouldOverwrite) {
+          throw new Error(
+            `Output file ${output} already exists. Set overwrite: true to overwrite.`
+          );
         }
 
-        const stats = await fs.stat(inputPath);
+        const outputDir = path.dirname(output);
+        if (!(await exists(outputDir))) {
+          await fs.mkdir(outputDir, { recursive: true });
+        }
+
+        if (!(await exists(input))) {
+          throw new Error(`Input path not found: ${input}`);
+        }
+
+        const stats = await fs.stat(input);
+        const filesToCompress: { name: string; data: Uint8Array }[] = [];
 
         if (stats.isDirectory()) {
-          // Process directory
-          const baseDir = path.basename(inputPath);
-          const files = await getAllFiles(inputPath);
+          const baseDir = path.basename(input);
+          const files = await getAllFiles(input);
 
           for (const relPath of files) {
-            const fullPath = path.join(inputPath, relPath);
+            const fullPath = path.join(input, relPath);
             const data = await fs.readFile(fullPath);
-            // Maintain relative path structure
             filesToCompress.push({
               name: path.join(baseDir, relPath),
               data: new Uint8Array(data),
             });
           }
         } else {
-          // Process single file
-          const data = await fs.readFile(inputPath);
+          const data = await fs.readFile(input);
           filesToCompress.push({
-            name: path.basename(inputPath),
+            name: path.basename(input),
             data: new Uint8Array(data),
           });
         }
-      }
 
-      if(compressionOptions?.level && compressionOptions.level > 9) {
-        compressionOptions.level = 9;
-      }
-
-      if(compressionOptions?.level && compressionOptions.level < 0) {
-        compressionOptions.level = 0;
-      }
-
-      // Execute compression
-      const result = await compressData(filesToCompress, compressionOptions);
-
-      // Write result to file
-      await fs.writeFile(outputPath, result);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Compression completed. Created ${outputPath} file containing ${filesToCompress.length} files.`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `Compression failed: ${formatError(error)}` }],
-      };
-    }
-  },
-});
-
-// Decompression tool - Decompress local ZIP file
-server.addTool({
-  name: "decompress",
-  description: "Decompress local ZIP file to specified directory",
-  parameters: z.object({
-    input: z.string(), // ZIP file path
-    output: z.string(), // Output directory path
-    options: z
-      .object({
-        password: z.string().optional(),
-        overwrite: z.boolean().optional(),
-        createDirectories: z.boolean().optional(),
-      })
-      .optional(),
-  }),
-  execute: async (args) => {
-    try {
-      const inputPath = args.input;
-      const outputPath = args.output;
-      const options: DecompressionOptions & {
-        overwrite?: boolean;
-        createDirectories?: boolean;
-      } = args.options || {};
-      const overwrite = options.overwrite ?? false;
-      const createDirectories = options.createDirectories ?? true;
-
-      // Check if input file exists
-      if (!(await exists(inputPath))) {
-        throw new Error(`Input file not found: ${inputPath}`);
-      }
-
-      // Check output directory
-      if (await exists(outputPath)) {
-        const stats = await fs.stat(outputPath);
-        if (!stats.isDirectory()) {
-          throw new Error(`Output path is not a directory: ${outputPath}`);
+        if (compressionOptions?.level && compressionOptions.level > 9) {
+          compressionOptions.level = 9;
         }
-      } else {
-        if (createDirectories) {
-          await fs.mkdir(outputPath, { recursive: true });
+        if (compressionOptions?.level && compressionOptions.level < 0) {
+          compressionOptions.level = 0;
+        }
+
+        const result = await compressData(filesToCompress, compressionOptions);
+        await fs.writeFile(output, result);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Compression completed. Created ${output} file containing ${filesToCompress.length} files.`,
+            },
+          ],
+        };
+      }
+
+      case "decompress": {
+        const input = args.input as string;
+        const output = args.output as string;
+        const options = args.options as {
+          password?: string;
+          overwrite?: boolean;
+          createDirectories?: boolean;
+        } | undefined;
+
+        const overwrite = options?.overwrite ?? false;
+        const createDirectories = options?.createDirectories ?? true;
+
+        if (!(await exists(input))) {
+          throw new Error(`Input file not found: ${input}`);
+        }
+
+        if (await exists(output)) {
+          const stats = await fs.stat(output);
+          if (!stats.isDirectory()) {
+            throw new Error(`Output path is not a directory: ${output}`);
+          }
         } else {
-          throw new Error(`Output directory does not exist: ${outputPath}`);
+          if (createDirectories) {
+            await fs.mkdir(output, { recursive: true });
+          } else {
+            throw new Error(`Output directory does not exist: ${output}`);
+          }
         }
+
+        const zipData = await fs.readFile(input);
+        const result = await decompressData(new Uint8Array(zipData), options || {});
+
+        const extractedFiles: string[] = [];
+        for (const file of result) {
+          const outputFilePath = path.join(output, file.name);
+          const outputFileDir = path.dirname(outputFilePath);
+
+          if (!(await exists(outputFileDir))) {
+            await fs.mkdir(outputFileDir, { recursive: true });
+          }
+
+          if ((await exists(outputFilePath)) && !overwrite) {
+            continue;
+          }
+
+          await fs.writeFile(outputFilePath, file.data);
+          extractedFiles.push(file.name);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Decompression completed. Extracted ${extractedFiles.length} files to ${output}`,
+            },
+          ],
+        };
       }
 
-      // Read ZIP file
-      const zipData = await fs.readFile(inputPath);
+      case "getZipInfo": {
+        const input = args.input as string;
+        const options = args.options as { password?: string } | undefined;
 
-      // Decompress file
-      const result = await decompressData(new Uint8Array(zipData), options);
-
-      // Extract files to output directory
-      const extractedFiles: string[] = [];
-      for (const file of result) {
-        const outputFilePath = path.join(outputPath, file.name);
-        const outputFileDir = path.dirname(outputFilePath);
-
-        // Create directory (if needed)
-        if (!(await exists(outputFileDir))) {
-          await fs.mkdir(outputFileDir, { recursive: true });
+        if (!(await exists(input))) {
+          throw new Error(`Input file not found: ${input}`);
         }
 
-        // Check if file already exists
-        if ((await exists(outputFilePath)) && !overwrite) {
-          console.warn(`Skipping existing file: ${outputFilePath}`);
-          continue;
-        }
+        const zipData = await fs.readFile(input);
+        const metadata = await getZipInfo(new Uint8Array(zipData), options || {});
 
-        // Write file
-        await fs.writeFile(outputFilePath, file.data);
-        extractedFiles.push(file.name);
+        const compressionRatio =
+          metadata.totalSize > 0
+            ? ((1 - metadata.totalCompressedSize / metadata.totalSize) * 100).toFixed(2) + "%"
+            : "0%";
+
+        const formatSize = (size: number): string => {
+          if (size < 1024) return `${size} B`;
+          if (size < 1024 * 1024) return `${(size / 1024).toFixed(2)} KB`;
+          if (size < 1024 * 1024 * 1024)
+            return `${(size / (1024 * 1024)).toFixed(2)} MB`;
+          return `${(size / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+        };
+
+        const filesInfo = metadata.files
+          .map(
+            (file: ZipInfo) =>
+              `- ${file.filename}: Original size=${formatSize(file.size)}, Compressed=${formatSize(file.compressedSize)}, Encrypted=${file.encrypted ? "Yes" : "No"}`
+          )
+          .join("\n");
+
+        return {
+          content: [
+            { type: "text", text: `ZIP file "${path.basename(input)}" information:` },
+            { type: "text", text: `Total files: ${metadata.files.length}` },
+            { type: "text", text: `Total size: ${formatSize(metadata.totalSize)}` },
+            { type: "text", text: `Compressed size: ${formatSize(metadata.totalCompressedSize)}` },
+            { type: "text", text: `Compression ratio: ${compressionRatio}` },
+            { type: "text", text: `\nFile details:\n${filesInfo}` },
+          ],
+        };
       }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Decompression completed. Extracted ${extractedFiles.length} files to ${outputPath}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `Decompression failed: ${formatError(error)}` }],
-      };
+      case "echo": {
+        const message = args.message as string;
+        return {
+          content: [
+            { type: "text", text: message },
+            { type: "text", text: new Date().toISOString() },
+          ],
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
     }
-  },
-});
-
-// Get ZIP info tool - Get local ZIP file information
-server.addTool({
-  name: "getZipInfo",
-  description: "Get metadata information of a local ZIP file",
-  parameters: z.object({
-    input: z.string(), // ZIP file path
-    options: z
-      .object({
-        password: z.string().optional(),
-      })
-      .optional(),
-  }),
-  execute: async (args) => {
-    try {
-      const inputPath = args.input;
-      const options: DecompressionOptions = args.options || {};
-
-      // Check if input file exists
-      if (!(await exists(inputPath))) {
-        throw new Error(`Input file not found: ${inputPath}`);
-      }
-
-      // Read ZIP file
-      const zipData = await fs.readFile(inputPath);
-
-      // Get ZIP information
-      const metadata = await getZipInfo(new Uint8Array(zipData), options);
-
-      const compressionRatio =
-        metadata.totalSize > 0
-          ? (
-              (1 - metadata.totalCompressedSize / metadata.totalSize) *
-              100
-            ).toFixed(2) + "%"
-          : "0%";
-
-      // File size formatting
-      const formatSize = (size: number): string => {
-        if (size < 1024) return `${size} B`;
-        if (size < 1024 * 1024) return `${(size / 1024).toFixed(2)} KB`;
-        if (size < 1024 * 1024 * 1024)
-          return `${(size / (1024 * 1024)).toFixed(2)} MB`;
-        return `${(size / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-      };
-
-      // Build file information text
-      const filesInfo = metadata.files
-        .map(
-          (file: ZipInfo) =>
-            `- ${file.filename}: Original size=${formatSize(
-              file.size
-            )}, Compressed=${formatSize(file.compressedSize)}, Modified date=${new Date(
-              file.lastModDate
-            ).toLocaleString()}, Encrypted=${file.encrypted ? "Yes" : "No"}`
-        )
-        .join("\n");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `ZIP file "${path.basename(inputPath)}" information overview:`,
-          },
-          { type: "text", text: `Total files: ${metadata.files.length}` },
-          { type: "text", text: `Total size: ${formatSize(metadata.totalSize)}` },
-          {
-            type: "text",
-            text: `Compressed size: ${formatSize(metadata.totalCompressedSize)}`,
-          },
-          { type: "text", text: `Compression ratio: ${compressionRatio}` },
-          {
-            type: "text",
-            text: metadata.comment ? `Comment: ${metadata.comment}` : "",
-          },
-          { type: "text", text: `\nFile details:\n${filesInfo}` },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          { type: "text", text: `Failed to get ZIP information: ${formatError(error)}` },
-        ],
-      };
-    }
-  },
-});
-
-// Test tool - Simple echo function to test if the service is running properly
-server.addTool({
-  name: "echo",
-  description: "Return the input message (for testing)",
-  parameters: z.object({
-    message: z.string(),
-  }),
-  execute: async (args) => {
+  } catch (error) {
     return {
-      content: [
-        { type: "text", text: args.message },
-        { type: "text", text: new Date().toISOString() },
-      ],
+      content: [{ type: "text", text: `Error: ${formatError(error)}` }],
+      isError: true,
     };
-  },
+  }
 });
 
-// Start server
-server.start({
-  transportType: "stdio",
-});
+// Start server with stdio transport
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("ZIP MCP Server started");
+}
 
-console.log("ZIP MCP Server started");
+main().catch(console.error);
